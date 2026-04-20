@@ -50,6 +50,7 @@ import (
 	"github.com/danielpaulus/go-ios/ios/instruments"
 	"github.com/danielpaulus/go-ios/ios/mcinstall"
 	"github.com/danielpaulus/go-ios/ios/notificationproxy"
+	"github.com/danielpaulus/go-ios/ios/ostrace"
 	"github.com/danielpaulus/go-ios/ios/pcap"
 	syslog "github.com/danielpaulus/go-ios/ios/syslog"
 	"github.com/docopt/docopt-go"
@@ -141,6 +142,7 @@ Usage:
   ios setlocation [options] [--lat=<lat>] [--lon=<lon>]
   ios setlocationgpx [options] [--gpxfilepath=<gpxfilepath>]
   ios syslog [--parse] [options]
+  ios ostrace [--pid=<processID>] [--process=<processName>] [--level=<levels>] [--subsystem=<sub>] [--match=<str>] [--exclude=<str>] [options]
   ios sysmontap [options]
   ios timeformat (24h | 12h | toggle | get) [--force] [options]
   ios tunnel ls [options]
@@ -375,6 +377,17 @@ The commands work as following:
                                                                     Ex.: setlocationgpx --gpxfilepath=/home/username/location.gpx
 
     ios syslog [--parse] [options]                                  Prints a device's log output, Use --parse to parse the fields from the log
+    ios ostrace [--pid=<processID>] [--process=<processName>] [--level=<levels>] [--subsystem=<sub>] [--match=<str>] [--exclude=<str>]
+                                                                    Stream structured syslog via os_trace_relay. Note: streaming logs
+                                                                    places significant CPU load on the device.
+                                                                    Device-side filters (reduce USB traffic):
+                                                                      --pid=<pid>           Only stream logs from this process ID
+                                                                      --process=<name>      Resolve process name to PID, then filter device-side
+                                                                      --level=<levels>      Filter by OS log type (comma-separated): default,info,debug,error,fault
+                                                                    Client-side filters (applied after receiving, does not reduce USB traffic):
+                                                                      --subsystem=<sub>     Only show entries matching this subsystem (substring match)
+                                                                      --match=<str>         Only show entries where the message contains this string
+                                                                      --exclude=<str>       Hide entries where the message contains this string
     ios sysmontap                                                   Get system stats like MEM, CPU
 
     ios timeformat (24h | 12h | toggle | get) [--force] [options]   Sets, or returns the state of the "time format".
@@ -840,6 +853,32 @@ The commands work as following:
 		return
 	}
 
+	b, _ = arguments.Bool("ostrace")
+	if b {
+		pidStr, _ := arguments.String("--pid")
+		processName, _ := arguments.String("--process")
+		levelStr, _ := arguments.String("--level")
+		subsystem, _ := arguments.String("--subsystem")
+		match, _ := arguments.String("--match")
+		exclude, _ := arguments.String("--exclude")
+		pid := -1
+		if pidStr != "" {
+			var err error
+			pid, err = strconv.Atoi(pidStr)
+			exitIfError("invalid --pid value", err)
+		}
+		levelFilter, err := ostrace.ParseLevelFilter(levelStr)
+		exitIfError("invalid --level value", err)
+		clientFilter := ostrace.ClientFilter{
+			Levels:    levelFilter.ClientLevels,
+			Subsystem: subsystem,
+			Match:     match,
+			Exclude:   exclude,
+		}
+		runOsTrace(device, pid, processName, levelFilter.MessageFilter, levelFilter.StreamFlags, clientFilter)
+		return
+	}
+
 	b, _ = arguments.Bool("screenshot")
 	if b {
 		stream, _ := arguments.Bool("--stream")
@@ -1070,13 +1109,12 @@ The commands work as following:
 		exitIfError("failed opening deviceInfoService for getting process list", err)
 		defer svc.Close()
 
-		processList, _ := svc.ProcessList()
-		for _, process := range processList {
-			if process.Pid > 1 && process.Name == processName {
-				disabled, err := pControl.DisableMemoryLimit(process.Pid)
-				exitIfError("DisableMemoryLimit failed", err)
-				log.WithFields(log.Fields{"process": process.Name, "pid": process.Pid}).Info("memory limit is off: ", disabled)
-			}
+		process, err := svc.ProcessByName(processName)
+		exitIfError("process not found", err)
+		if process.Pid > 1 {
+			disabled, err := pControl.DisableMemoryLimit(process.Pid)
+			exitIfError("DisableMemoryLimit failed", err)
+			log.WithFields(log.Fields{"process": process.Name, "pid": process.Pid}).Info("memory limit is off: ", disabled)
 		}
 	}
 
@@ -2729,6 +2767,45 @@ func runSyslog(device ios.DeviceEntry, parse bool) {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	<-c
+}
+
+func runOsTrace(device ios.DeviceEntry, pid int, processName string, messageFilter uint16, streamFlags uint32, clientFilter ostrace.ClientFilter) {
+	log.Debug("Run OsTrace.")
+	// Note: streaming log messages places significant CPU load on the device.
+
+	if processName != "" && pid == -1 {
+		service, err := instruments.NewDeviceInfoService(device)
+		exitIfError("failed opening deviceInfoService for resolving process name", err)
+		proc, err := service.ProcessByName(processName)
+		service.Close()
+		exitIfError("process not found", err)
+		pid = int(proc.Pid)
+		log.Infof("Resolved process %q to PID %d", processName, pid)
+	}
+
+	conn, err := ostrace.New(device, pid, messageFilter, streamFlags)
+	exitIfError("os_trace connection failed", err)
+	defer conn.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		for {
+			entry, err := conn.ReadFilteredEntry(clientFilter)
+			if err != nil {
+				done <- err
+				return
+			}
+			fmt.Println(convertToJSONString(entry))
+		}
+	}()
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	select {
+	case <-c:
+	case err := <-done:
+		conn.Close()
+		exitIfError("failed reading os_trace entry", err)
+	}
 }
 
 func rawSyslog(log string) string {
